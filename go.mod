@@ -7,7 +7,7 @@ require (
 	github.com/charmbracelet/bubbletea v0.19.2
 	github.com/charmbracelet/lipgloss v0.4.0
 	github.com/joho/godotenv v1.4.0
-	github.com/knightpp/mal-api v0.0.0-20211223194816-bb67e6bf2cee
+	github.com/knightpp/mal-api v0.0.0-20211227110430-ce467ec52b46
 	go.uber.org/zap v1.19.1
 	golang.org/x/oauth2 v0.0.0-20211104180415-d3ed0bb246c8
 )

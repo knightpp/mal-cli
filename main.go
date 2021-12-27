@@ -27,6 +27,14 @@ const (
 	statusIdle
 )
 
+type state int
+
+const (
+	stateInitializing state = iota
+	stateMyRecentAnime
+	stateSearchAnime
+)
+
 func (s status) String() string {
 	switch s {
 	case statusLoading:
@@ -41,10 +49,21 @@ func (s status) String() string {
 type model struct {
 	spinner spinner.Model
 	status  status
+	tHeight int
+	tWidth  int
 
-	list     *mal.UserAnimeListPage
-	selected int
-	client   *mal.Client
+	// myRecent myRecentState
+
+	// my recent anime
+	myAnimeList *mal.UserAnimePage
+	selected    int
+	// end
+
+	searchAnimeList *mal.AnimeSearchPage
+
+	state state
+
+	client *mal.Client
 }
 
 func initialModel() model {
@@ -52,8 +71,7 @@ func initialModel() model {
 	s.Spinner = spinner.Points
 
 	return model{
-		spinner:  s,
-		selected: 0,
+		spinner: s,
 	}
 }
 
@@ -61,7 +79,7 @@ func (m model) Init() tea.Cmd {
 	return tea.Batch(spinner.Tick, tea.Cmd(func() tea.Msg {
 		client, err := setupClient()
 		if err != nil {
-			return MsgLoadedAnimeList{Err: err}
+			return MsgLoadedMyRecentAnimeList{Err: err}
 		}
 
 		list, err := client.GetMyAnimeList(mal.AnimeListOptions{
@@ -69,20 +87,25 @@ func (m model) Init() tea.Cmd {
 			Sort:   mal.SortListUpdatedAt,
 		}, mal.Fields("list_status", "num_episodes", "alternative_titles"))
 
-		return MsgLoadedAnimeList{Ok: list, Client: client, Err: err}
+		return MsgLoadedMyRecentAnimeList{Ok: list, Client: client, Err: err}
 	}))
 }
 
-type MsgLoadedAnimeList struct {
-	Ok     *mal.UserAnimeListPage
+type MsgLoadedMyRecentAnimeList struct {
+	Ok     *mal.UserAnimePage
 	Client *mal.Client
 	Err    error
 }
 
-type MsgUpdatedList struct {
+type MsgUpdatedMyRecentAnimeList struct {
 	Ok   *mal.AnimeUpdateResponse
-	List *mal.UserAnimeList
+	List *mal.UserAnime
 	Err  error
+}
+
+type MsgAppendToMyRecentList struct {
+	Ok  *mal.UserAnimePage
+	Err error
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -96,7 +119,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "ctrl+c", "q":
 			return m, tea.Quit
 		case "w":
-			if m.list == nil {
+			if m.myAnimeList == nil {
 				break
 			}
 			if m.selected-1 >= 0 {
@@ -104,12 +127,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		case "s":
-			if m.list == nil {
+			if m.myAnimeList == nil {
 				break
 			}
-			if m.selected+1 <= len(m.list.Data) {
+			if m.selected < len(m.myAnimeList.Data)-1 {
 				m.selected += 1
 				return m, nil
+			} else {
+				// next page
+				m.status = statusLoading
+				return m, func() tea.Msg {
+					list, err := m.myAnimeList.NextPage(m.client)
+					return MsgAppendToMyRecentList{
+						Ok:  list,
+						Err: err,
+					}
+				}
 			}
 
 		case "d":
@@ -118,17 +151,23 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "a":
 			m.status = statusLoading
 			return m, addNumWatchedEpisodes(-1, m)
+		case "/":
+			if m.state == stateMyRecentAnime {
+				m.state = stateSearchAnime
+				m.status = statusLoading
+				return m, nil
+			}
 		}
-	case MsgLoadedAnimeList:
+	case MsgLoadedMyRecentAnimeList:
 		if msg.Err != nil {
 			return m, tea.Quit
 		}
-		m.list = msg.Ok
+		m.myAnimeList = msg.Ok
 		m.client = msg.Client
 		m.status = statusIdle
+		m.state = stateMyRecentAnime
 		return m, nil
-	case MsgUpdatedList:
-		log.Info("UpdateList()", zap.Any("resp", msg.Ok), zap.Error(msg.Err))
+	case MsgUpdatedMyRecentAnimeList:
 		if msg.Err != nil {
 			return m, tea.Quit
 		}
@@ -139,6 +178,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			msg.List.ListStatus.Status = msg.Ok.Status
 		}
 		return m, nil
+	case MsgAppendToMyRecentList:
+		if msg.Err != nil {
+			log.Error("MsgAppendToMyRecentList", zap.Error(msg.Err))
+			return m, tea.Quit
+		}
+		m.myAnimeList.Data = append(m.myAnimeList.Data, msg.Ok.Data...)
+		m.myAnimeList.Paging.Next = msg.Ok.Paging.Next
+		m.status = statusIdle
+	case tea.WindowSizeMsg:
+		m.tWidth = msg.Width
+		m.tHeight = msg.Height
 	default:
 		if m.status == statusLoading {
 			var cmd tea.Cmd
@@ -180,28 +230,39 @@ func (m model) View() string {
 		fmt.Fprintf(&buf, "%s\n", statusLineText.Render(m.status.String()))
 	}
 
-	if m.list == nil {
-		return buf.String()
-	}
+	switch m.state {
+	case stateInitializing:
+		buf.WriteString("Initializing...")
+	case stateSearchAnime:
 
-	for i, anime := range m.list.Data {
-		if i == m.selected {
-			buf.WriteString("👉 ")
-		} else {
-			buf.WriteString("   ")
+	case stateMyRecentAnime:
+		if m.myAnimeList == nil {
+			break
 		}
-		fmt.Fprintf(&buf, "%s / %s %s\n",
-			watchedStyle.Render(fmt.Sprint(anime.ListStatus.NumEpisodesWatched)),
-			totalStyle.Render(fmt.Sprint(anime.Node.NumEpisodes)),
-			titleStyle.Render(PrefTitle(&anime.Node)),
-		)
+		if m.myAnimeList.Paging.HasPrev() {
+			fmt.Fprintf(&buf, "   Previous ^^^")
+		}
+		for i, anime := range m.myAnimeList.Data {
+			if i == m.selected {
+				buf.WriteString("👉 ")
+			} else {
+				buf.WriteString("   ")
+			}
+			fmt.Fprintf(&buf, "%s / %s %s\n",
+				watchedStyle.Render(fmt.Sprint(anime.ListStatus.NumEpisodesWatched)),
+				totalStyle.Render(fmt.Sprint(anime.Node.NumEpisodes)),
+				titleStyle.Render(PrefTitle(&anime.Node)),
+			)
+		}
+		if m.myAnimeList.Paging.HasNext() {
+			fmt.Fprintf(&buf, "   Next vvv")
+		}
 	}
-
 	return buf.String()
 }
 
 func addNumWatchedEpisodes(n int, m model) func() tea.Msg {
-	list := &m.list.Data[m.selected]
+	list := &m.myAnimeList.Data[m.selected]
 	opts := mal.UpdateListOpts()
 	episodes := list.Node.NumEpisodes
 	watched := list.ListStatus.NumEpisodesWatched
@@ -215,7 +276,7 @@ func addNumWatchedEpisodes(n int, m model) func() tea.Msg {
 		opts.NumWatchedEpisodes(watched + n)
 		return tea.Batch(func() tea.Msg {
 			resp, err := m.client.UpdateAnimeList(list.Node.ID, opts)
-			return MsgUpdatedList{Ok: resp, Err: err, List: list}
+			return MsgUpdatedMyRecentAnimeList{Ok: resp, Err: err, List: list}
 		}, spinner.Tick)
 	default:
 		return nil
@@ -235,7 +296,7 @@ var log *zap.Logger
 func main() {
 	cfg := zap.NewDevelopmentConfig()
 	cfg.OutputPaths = []string{"mal.log"}
-	cfg.ErrorOutputPaths = []string{"internal-errors.log"}
+	cfg.ErrorOutputPaths = []string{"mal.log", "stderr"}
 
 	// logger, err := zap.NewDevelopment()
 	logger, err := cfg.Build()
@@ -248,7 +309,7 @@ func main() {
 
 	err = godotenv.Load()
 	if err != nil {
-		log.Fatal("couldn't load .env file", zap.Error(err))
+		log.Warn("couldn't load .env file", zap.Error(err))
 	}
 
 	p := tea.NewProgram(initialModel())
@@ -288,7 +349,12 @@ func setupClient() (*mal.Client, error) {
 }
 
 func doOAuth() (*oauth2.Token, error) {
-	auth := mal.NewOauth(os.Getenv("MAL_CLIENT_ID"))
+	clientID := os.Getenv("MAL_CLIENT_ID")
+	if clientID == "" {
+		return nil, fmt.Errorf("environmental variable MAL_CLIENT_ID is empty or unset")
+	}
+
+	auth := mal.NewOauth(clientID)
 	challenge := auth.NewCodeVerifier()
 	url := auth.AuthCodeURL("myState", challenge)
 	codeChan := make(chan string, 1)
