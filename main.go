@@ -10,285 +10,93 @@ import (
 	"strings"
 	"time"
 
-	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
 	"github.com/joho/godotenv"
 	"go.uber.org/zap"
 	"golang.org/x/oauth2"
 
 	"github.com/knightpp/mal-api/mal"
+	"github.com/knightpp/mal-cli/widget"
+	"github.com/knightpp/mal-cli/widget/initialize"
+	"github.com/knightpp/mal-cli/widget/recent"
+	"github.com/knightpp/mal-cli/widget/status"
 )
-
-type status int
-
-const (
-	statusLoading status = iota
-	statusIdle
-)
-
-type state int
-
-const (
-	stateInitializing state = iota
-	stateMyRecentAnime
-	stateSearchAnime
-)
-
-func (s status) String() string {
-	switch s {
-	case statusLoading:
-		return "Loading..."
-	case statusIdle:
-		return "Idling"
-	default:
-		return "unknown"
-	}
-}
 
 type model struct {
-	spinner spinner.Model
-	status  status
-	tHeight int
-	tWidth  int
-
-	// myRecent myRecentState
-
-	// my recent anime
-	myAnimeList *mal.UserAnimePage
-	selected    int
-	// end
-
-	searchAnimeList *mal.AnimeSearchPage
-
-	state state
+	// widgets
+	widgetStack widget.WidgetStack
 
 	client *mal.Client
 }
 
 func initialModel() model {
-	s := spinner.NewModel()
-	s.Spinner = spinner.Points
-
+	sl := status.NewStatusLine(initialize.New())
 	return model{
-		spinner: s,
+		widgetStack: widget.NewWidgetStack(sl),
 	}
 }
 
-func (m model) Init() tea.Cmd {
-	return tea.Batch(spinner.Tick, tea.Cmd(func() tea.Msg {
+func initClient() tea.Cmd {
+	return tea.Cmd(func() tea.Msg {
 		client, err := setupClient()
 		if err != nil {
-			return MsgLoadedMyRecentAnimeList{Err: err}
+			return tea.Quit
 		}
-
-		list, err := client.GetMyAnimeList(mal.AnimeListOptions{
-			Status: mal.StatusWatching,
-			Sort:   mal.SortListUpdatedAt,
-		}, mal.Fields("list_status", "num_episodes", "alternative_titles"))
-
-		return MsgLoadedMyRecentAnimeList{Ok: list, Client: client, Err: err}
-	}))
+		return MsgClientReady{client}
+	})
 }
 
-type MsgLoadedMyRecentAnimeList struct {
-	Ok     *mal.UserAnimePage
-	Client *mal.Client
-	Err    error
+func (m model) Init() tea.Cmd {
+	return tea.Batch(m.widgetStack.Init(), initClient())
 }
 
-type MsgUpdatedMyRecentAnimeList struct {
-	Ok   *mal.AnimeUpdateResponse
-	List *mal.UserAnime
-	Err  error
-}
-
-type MsgAppendToMyRecentList struct {
-	Ok  *mal.UserAnimePage
-	Err error
+type MsgClientReady struct {
+	client *mal.Client
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
-	case tea.KeyMsg:
-
-		// Cool, what was the actual key pressed?
-		switch msg.String() {
-
-		// These keys should exit the program.
-		case "ctrl+c", "q":
-			return m, tea.Quit
-		case "w":
-			if m.myAnimeList == nil {
-				break
-			}
-			if m.selected-1 >= 0 {
-				m.selected -= 1
-				return m, nil
-			}
-		case "s":
-			if m.myAnimeList == nil {
-				break
-			}
-			if m.selected < len(m.myAnimeList.Data)-1 {
-				m.selected += 1
-				return m, nil
-			} else {
-				// next page
-				m.status = statusLoading
-				return m, func() tea.Msg {
-					list, err := m.myAnimeList.NextPage(m.client)
-					return MsgAppendToMyRecentList{
-						Ok:  list,
-						Err: err,
-					}
-				}
-			}
-
-		case "d":
-			m.status = statusLoading
-			return m, addNumWatchedEpisodes(1, m)
-		case "a":
-			m.status = statusLoading
-			return m, addNumWatchedEpisodes(-1, m)
-		case "/":
-			if m.state == stateMyRecentAnime {
-				m.state = stateSearchAnime
-				m.status = statusLoading
-				return m, nil
-			}
-		}
-	case MsgLoadedMyRecentAnimeList:
-		if msg.Err != nil {
-			return m, tea.Quit
-		}
-		m.myAnimeList = msg.Ok
-		m.client = msg.Client
-		m.status = statusIdle
-		m.state = stateMyRecentAnime
-		return m, nil
-	case MsgUpdatedMyRecentAnimeList:
-		if msg.Err != nil {
-			return m, tea.Quit
-		}
-
-		m.status = statusIdle
-		msg.List.ListStatus.NumEpisodesWatched = msg.Ok.NumEpisodesWatched
-		if msg.Ok.Status != "" {
-			msg.List.ListStatus.Status = msg.Ok.Status
-		}
-		return m, nil
-	case MsgAppendToMyRecentList:
-		if msg.Err != nil {
-			log.Error("MsgAppendToMyRecentList", zap.Error(msg.Err))
-			return m, tea.Quit
-		}
-		m.myAnimeList.Data = append(m.myAnimeList.Data, msg.Ok.Data...)
-		m.myAnimeList.Paging.Next = msg.Ok.Paging.Next
-		m.status = statusIdle
-	case tea.WindowSizeMsg:
-		m.tWidth = msg.Width
-		m.tHeight = msg.Height
+	case MsgClientReady:
+		m.client = msg.client
+		m.widgetStack.Pop()
+		newWidget := status.NewStatusLine(recent.New(m.client))
+		newWidget.SetStatus(status.Idle)
+		m.widgetStack.Push(newWidget)
+		return m, newWidget.Init()
 	default:
-		if m.status == statusLoading {
-			var cmd tea.Cmd
-			m.spinner, cmd = m.spinner.Update(msg)
-			return m, cmd
+		if msg, ok := msg.(tea.KeyMsg); ok {
+			switch msg.String() {
+			case "ctrl+c", "q":
+				return m, tea.Quit
+			}
 		}
+		return m, m.widgetStack.Update(msg)
 	}
 
-	return m, nil
 }
+
+// type batch struct {
+// 	buf []tea.Cmd
+// }
+
+// func (b *batch) Add(cmd tea.Cmd) {
+// 	if cmd != nil {
+// 		b.buf = append(b.buf, cmd)
+// 	}
+// }
+// func (b *batch) Cmd() tea.Cmd {
+// 	if len(b.buf) == 0 {
+// 		return nil
+// 	} else if len(b.buf) == 1 {
+// 		return b.buf[0]
+// 	}
+// 	return tea.Batch(b.buf...)
+// }
 
 func (m model) View() string {
-	titleStyle := lipgloss.NewStyle().
-		Foreground(lipgloss.Color("141"))
-	watchedStyle := lipgloss.NewStyle().
-		Foreground(lipgloss.Color("45")).
-		Width(3).
-		Align(lipgloss.Right)
-	totalStyle := lipgloss.NewStyle().
-		Foreground(lipgloss.Color("39")).
-		Width(3).
-		Align(lipgloss.Right)
-
 	var buf strings.Builder
-	// #343433 // nice grey
-	// #0044b3
-	statusLineText := lipgloss.NewStyle().
-		Background(lipgloss.Color("#343433")).
-		Width(15).
-		Bold(true).
-		Align(lipgloss.Center)
-
-	if m.status == statusLoading {
-		fmt.Fprintf(&buf, "%s %s\n",
-			statusLineText.Render(m.status.String()),
-			m.spinner.View(),
-		)
-	} else {
-		fmt.Fprintf(&buf, "%s\n", statusLineText.Render(m.status.String()))
-	}
-
-	switch m.state {
-	case stateInitializing:
-		buf.WriteString("Initializing...")
-	case stateSearchAnime:
-
-	case stateMyRecentAnime:
-		if m.myAnimeList == nil {
-			break
-		}
-		if m.myAnimeList.Paging.HasPrev() {
-			fmt.Fprintf(&buf, "   Previous ^^^")
-		}
-		for i, anime := range m.myAnimeList.Data {
-			if i == m.selected {
-				buf.WriteString("👉 ")
-			} else {
-				buf.WriteString("   ")
-			}
-			fmt.Fprintf(&buf, "%s / %s %s\n",
-				watchedStyle.Render(fmt.Sprint(anime.ListStatus.NumEpisodesWatched)),
-				totalStyle.Render(fmt.Sprint(anime.Node.NumEpisodes)),
-				titleStyle.Render(PrefTitle(&anime.Node)),
-			)
-		}
-		if m.myAnimeList.Paging.HasNext() {
-			fmt.Fprintf(&buf, "   Next vvv")
-		}
-	}
+	m.widgetStack.Peek().View(&buf)
 	return buf.String()
-}
-
-func addNumWatchedEpisodes(n int, m model) func() tea.Msg {
-	list := &m.myAnimeList.Data[m.selected]
-	opts := mal.UpdateListOpts()
-	episodes := list.Node.NumEpisodes
-	watched := list.ListStatus.NumEpisodesWatched
-
-	switch {
-	case episodes == watched+n:
-		opts.Status(mal.StatusCompleted)
-		opts.NumWatchedEpisodes(episodes)
-		fallthrough
-	case episodes > watched+n && watched+n >= 0:
-		opts.NumWatchedEpisodes(watched + n)
-		return tea.Batch(func() tea.Msg {
-			resp, err := m.client.UpdateAnimeList(list.Node.ID, opts)
-			return MsgUpdatedMyRecentAnimeList{Ok: resp, Err: err, List: list}
-		}, spinner.Tick)
-	default:
-		return nil
-	}
-}
-
-func PrefTitle(anime *mal.Anime) string {
-	titles := anime.AlternativeTitles
-	if titles.En != "" {
-		return titles.En
-	}
-	return anime.Title
 }
 
 var log *zap.Logger
